@@ -1,4 +1,4 @@
-# android-automount
+# android-automount-adbfs
 
 Mounts Android phones over `adb` the moment you plug them in, and asks what to do
 when it can't.
@@ -39,8 +39,8 @@ Python 3.10 or newer. No third-party Python packages.
 ## Install
 
 ```bash
-git clone https://github.com/YOURNAME/android-automount.git
-cd android-automount
+git clone https://github.com/Mortasen/android-automount-adbfs.git
+cd android-automount-adbfs
 ./install.sh
 ```
 
@@ -91,9 +91,11 @@ name, `adb shell settings list secure | grep name` will tell you where yours kee
 settings screen closes, not when you type it. Press Home after renaming, then
 replug.
 
-**MTP mounts are never unmounted by this service.** Tearing down an MTP mount
-leaves the session half-open on the phone, and nothing short of a replug reopens
-it. If MTP wedges with `Unable to open MTP device`, unplug and plug back in.
+**MTP mounts are left for gvfs to clean up, deliberately.** Nothing leaks: gvfs
+owns that mount and drops it when the phone leaves the bus. This service never
+unmounts one itself because tearing down a *live* MTP session leaves it half-open
+on the phone, and nothing short of a replug reopens it. If MTP ever wedges with
+`Unable to open MTP device`, unplug and plug back in.
 
 ## Development
 
