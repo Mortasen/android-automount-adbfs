@@ -36,10 +36,10 @@ def test_a_rejected_request_raises(am):
 def test_mtp_volume_is_found_by_serial(am):
 	am.run_text = lambda command: (
 		"Volume(1): REDMI Note 15 Pro+ 5G\n"
-		"  activation_root=mtp://Xiaomi_REDMI_Note_15_Pro+_5G_aba6a48f/\n"
+		"  activation_root=mtp://Xiaomi_REDMI_Note_15_Pro+_5G_1a2b3c4d/\n"
 		"  activation_root=google-drive://someone@example.com/\n"
 	)
-	assert am.find_mtp_address("aba6a48f") == "mtp://Xiaomi_REDMI_Note_15_Pro+_5G_aba6a48f/"
+	assert am.find_mtp_address("1a2b3c4d") == "mtp://Xiaomi_REDMI_Note_15_Pro+_5G_1a2b3c4d/"
 	assert am.find_mtp_address("nomatch") == ""
 
 
@@ -49,14 +49,14 @@ def test_an_empty_serial_does_not_match_every_volume(am):
 
 
 def test_non_mtp_volumes_are_never_returned(am):
-	am.run_text = lambda command: "  activation_root=google-drive://aba6a48f@example.com/\n"
-	assert am.find_mtp_address("aba6a48f") == ""
+	am.run_text = lambda command: "  activation_root=google-drive://1a2b3c4d@example.com/\n"
+	assert am.find_mtp_address("1a2b3c4d") == ""
 
 
 def test_waiting_gives_up_rather_than_blocking_forever(am):
 	am.find_mtp_address = lambda serial: ""
 	am.MTP_POLL_INTERVAL = 0.01
-	assert am.wait_for_mtp_contents("aba6a48f", 0.05) == ""
+	assert am.wait_for_mtp_contents("1a2b3c4d", 0.05) == ""
 
 
 def test_waiting_returns_the_address_once_storage_appears(am):
@@ -69,4 +69,4 @@ def test_waiting_returns_the_address_once_storage_appears(am):
 	am.find_mtp_address = lambda serial: "mtp://phone/"
 	am.mtp_storage_visible = storage_appears_late
 	am.MTP_POLL_INTERVAL = 0.01
-	assert am.wait_for_mtp_contents("aba6a48f", 1.0) == "mtp://phone/"
+	assert am.wait_for_mtp_contents("1a2b3c4d", 1.0) == "mtp://phone/"

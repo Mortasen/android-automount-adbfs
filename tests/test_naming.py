@@ -16,7 +16,7 @@ def test_slug_never_produces_a_hidden_or_empty_directory(am):
 
 def test_label_falls_back_to_the_serial_when_no_device_answers(am):
 	am.run_device_command = lambda serial, command: ""
-	assert am.read_device_label("ABA6A48F") == "aba6a48f"
+	assert am.read_device_label("1A2B3C4D") == "1a2b3c4d"
 
 
 def test_bluetooth_name_is_asked_before_the_stale_aosp_setting(am):
@@ -30,15 +30,15 @@ def test_unset_settings_are_treated_as_no_answer(am):
 
 
 def test_remembered_name_survives_a_round_trip(am):
-	am.remember_device_name("aba6a48f", "REDMI Note 15 Pro+")
-	assert am.remembered_device_name("aba6a48f") == "REDMI Note 15 Pro+"
+	am.remember_device_name("1a2b3c4d", "REDMI Note 15 Pro+")
+	assert am.remembered_device_name("1a2b3c4d") == "REDMI Note 15 Pro+"
 	assert am.NAME_CACHE.exists()
 
 
 def test_remembering_one_device_does_not_clobber_another(am):
-	am.remember_device_name("aba6a48f", "REDMI Note 15 Pro+")
+	am.remember_device_name("1a2b3c4d", "REDMI Note 15 Pro+")
 	am.remember_device_name("other", "Pixel 9")
-	assert set(am.read_remembered_names()) == {"aba6a48f", "other"}
+	assert set(am.read_remembered_names()) == {"1a2b3c4d", "other"}
 
 
 def test_blank_names_are_not_stored(am):
@@ -55,12 +55,12 @@ def test_a_damaged_cache_reads_as_empty(am):
 
 def test_an_unwritable_cache_does_not_raise(am):
 	am.NAME_CACHE = am.Path("/proc/cannot/write/here.json")
-	am.remember_device_name("aba6a48f", "Whatever")
+	am.remember_device_name("1a2b3c4d", "Whatever")
 
 
 def test_display_name_prefers_the_owners_name_over_the_usb_descriptor(am, phone):
 	assert am.device_display_name(phone) == "Xiaomi REDMI Note 15 Pro+ 5G"
-	am.remember_device_name("aba6a48f", "REDMI Note 15 Pro+")
+	am.remember_device_name("1a2b3c4d", "REDMI Note 15 Pro+")
 	assert am.device_display_name(phone) == "REDMI Note 15 Pro+"
 
 

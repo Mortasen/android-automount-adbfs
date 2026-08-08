@@ -51,8 +51,8 @@ def test_removals_are_recognised(am, phone):
 
 
 def test_devices_are_keyed_by_serial_so_re_enumeration_matches(am, phone):
-	assert am.device_key(phone) == "aba6a48f"
-	assert am.device_key(dict(phone, DEVPATH="/devices/x/usb3/3-9")) == "aba6a48f"
+	assert am.device_key(phone) == "1a2b3c4d"
+	assert am.device_key(dict(phone, DEVPATH="/devices/x/usb3/3-9")) == "1a2b3c4d"
 
 
 def test_devices_without_a_serial_fall_back_to_their_path(am):

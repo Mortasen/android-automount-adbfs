@@ -39,6 +39,6 @@ def phone():
 		"ID_USB_INTERFACES": ":060101:",
 		"ID_VENDOR": "Xiaomi",
 		"ID_MODEL": "REDMI_Note_15_Pro+_5G",
-		"ID_SERIAL_SHORT": "aba6a48f",
+		"ID_SERIAL_SHORT": "1a2b3c4d",
 		"DEVPATH": "/devices/pci0000:00/usb3/3-1",
 	}
