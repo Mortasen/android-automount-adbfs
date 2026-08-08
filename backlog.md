@@ -2,17 +2,6 @@
 
 Known gaps, roughly in order of how likely they are to bite someone.
 
-## The MTP hint can outlive the phone
-
-If you pick **Mount via MTP**, get the "not sharing files yet" notification, then
-unplug without granting access, the notification stays until its 3 minute timeout.
-The dialog handles this case; this code path does not.
-
-Fixing it needs a presence check that survives the re-enumeration caused by
-choosing *File transfer* on the phone, so it cannot simply watch the udev device
-path the way the dialog does. Matching on USB serial across `/sys/bus/usb/devices/*`
-would work.
-
 ## Only the first dialog gets pinned on top
 
 `find_dialog_window` matches the window by title. With two phones prompting at

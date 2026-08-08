@@ -33,6 +33,7 @@ from collections.abc import Iterator
 ADB_SERVER_ADDRESS = ("127.0.0.1", 5037)
 MOUNT_ROOT = Path.home() / "mnt" / "android"
 NAME_CACHE = Path.home() / ".cache" / "android-automount" / "device-names.json"
+USB_DEVICES = Path("/sys/bus/usb/devices")
 ADBFS_BINARY = Path(__file__).resolve().parent / "adbfs"
 ADB_BINARY = shutil.which("adb") or "/usr/bin/adb"
 
@@ -409,10 +410,24 @@ def guide_to_file_transfer(serial: str, name: str) -> None:
 	)
 	address = wait_for_mtp_contents(serial, MTP_ACCESS_TIMEOUT)
 	if not address:
-		log.info("%s never started sharing files", name)
+		withdraw_hint(hint, serial, name)
 		return
 	notify(f"{name} is ready", "Opening it in the file manager.", "normal", replaces=hint)
 	open_file_manager(address, name)
+
+
+def withdraw_hint(hint: str, serial: str, name: str) -> None:
+	"""Replace the standing hint so it cannot outlive what it was asking about.
+
+	The hint is deliberately sticky, so it has to be taken back rather than left
+	to expire once there is nothing left for the user to act on.
+	"""
+	if usb_serial_attached(serial):
+		log.info("%s never started sharing files", name)
+		notify(f"{name} was not mounted", "It never started sharing files.", "low", replaces=hint)
+		return
+	log.info("%s was unplugged before it shared any files", name)
+	notify(f"{name} disconnected", "Nothing was mounted.", "low", replaces=hint)
 
 
 def open_file_manager(address: str, name: str) -> None:
@@ -443,9 +458,40 @@ def wait_for_mtp_contents(serial: str, timeout: float) -> str:
 		address = find_mtp_address(serial)
 		if address and mtp_storage_visible(address):
 			return address
-		if time.monotonic() >= deadline:
+		if time.monotonic() >= deadline or phone_left_the_bus(serial):
 			return ""
 		time.sleep(MTP_POLL_INTERVAL)
+
+
+def phone_left_the_bus(serial: str) -> bool:
+	"""Report whether the phone is gone, forgiving a brief re-enumeration gap.
+
+	Switching to File transfer detaches and reattaches the phone within a second
+	or two, so a single absent reading is not enough to call it unplugged.
+	"""
+	if usb_serial_attached(serial):
+		return False
+	time.sleep(MTP_POLL_INTERVAL)
+	return not usb_serial_attached(serial)
+
+
+def usb_serial_attached(serial: str) -> bool:
+	"""Report whether a USB device with this serial is currently on the bus.
+
+	Devices are matched by serial rather than by the path udev announced, because
+	a phone that changes USB mode reappears under a new path with the same serial.
+	"""
+	if not serial:
+		return False
+	return any(read_sysfs(path) == serial for path in USB_DEVICES.glob("*/serial"))
+
+
+def read_sysfs(path: Path) -> str:
+	"""Read a small sysfs attribute, treating an unreadable one as empty."""
+	try:
+		return path.read_text().strip()
+	except OSError:
+		return ""
 
 
 def mtp_storage_visible(address: str) -> bool:
