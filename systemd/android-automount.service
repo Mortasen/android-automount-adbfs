@@ -1,0 +1,14 @@
+[Unit]
+Description=Mount connected Android devices with adbfs-rootless
+Documentation=https://github.com/spion/adbfs-rootless
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/android-automount
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

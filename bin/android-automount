@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""
+Mounts every connected Android device with adbfs-rootless and keeps the mounts
+in sync with what is actually plugged in.
+
+Two sources of truth are watched at once:
+
+* the adb server's ``host:track-devices`` stream, which reports devices whose
+  USB debugging is enabled -- authorised ones get mounted, unauthorised ones
+  produce a desktop prompt asking the user to accept the on-device dialog;
+* the udev USB event stream, which catches phones that expose only their media
+  (MTP/PTP) interface. Those are Android devices with USB debugging turned off,
+  and adb will never see them, so they get a prompt explaining how to enable it.
+
+Run as a systemd user service; log output ends up in the journal.
+"""
+
+import os
+import re
+import pty
+import json
+import time
+import signal
+import socket
+import shutil
+import logging
+import threading
+import subprocess
+from pathlib import Path
+from collections.abc import Iterator
+
+
+ADB_SERVER_ADDRESS = ("127.0.0.1", 5037)
+MOUNT_ROOT = Path.home() / "mnt" / "android"
+NAME_CACHE = Path.home() / ".cache" / "android-automount" / "device-names.json"
+ADBFS_BINARY = Path(__file__).resolve().parent / "adbfs"
+ADB_BINARY = shutil.which("adb") or "/usr/bin/adb"
+
+ADB_INTERFACE_PREFIX = ":ff42"
+MEDIA_INTERFACE_PREFIX = ":0601"
+
+DEVICE_NAME_COMMANDS = (
+	("settings", "get", "secure", "bluetooth_name"),
+	("settings", "get", "global", "device_name"),
+	("getprop", "ro.product.model"),
+	("getprop", "ro.product.device"),
+)
+
+CHOICE_RESOLVED = "resolved"
+CHOICE_MOUNT_MTP = "mount-mtp"
+CHOICE_DECLINE = "decline"
+MTP_BUTTON_LABEL = "Mount via MTP"
+DIALOG_TITLE = "Android device connected"
+
+DEBUGGING_PROMPT_DELAY = 4.0
+DECISION_COOLDOWN = 300.0
+DIALOG_APPEARANCE_TIMEOUT = 10.0
+DIALOG_POLL_INTERVAL = 0.2
+ADB_RECHECK_INTERVAL = 1.5
+MTP_FIRST_LOOK = 3.0
+MTP_ACCESS_TIMEOUT = 180.0
+MTP_POLL_INTERVAL = 3.0
+GIO_TIMEOUT = 20.0
+RECONNECT_DELAY = 5.0
+MOUNT_READY_TIMEOUT = 15.0
+MOUNT_POLL_INTERVAL = 0.25
+COMMAND_TIMEOUT = 60
+
+log = logging.getLogger("android-automount")
+
+
+def main() -> int:
+	"""Start both watchers and block until the service is stopped."""
+	configure_logging()
+	ensure_session_bus_address()
+	mounter = DeviceMounter()
+	monitor, usb_lines = start_udev_monitor()
+	install_shutdown_handler(mounter, monitor)
+	mounter.unmount_everything()
+	watcher_arguments = (usb_lines, DebuggingPrompter())
+	threading.Thread(target=watch_usb_for_disabled_debugging, args=watcher_arguments, daemon=True).start()
+	watch_adb_devices(mounter)
+	return 0
+
+
+def watch_adb_devices(mounter: "DeviceMounter") -> None:
+	"""Follow the adb device stream forever, reconnecting when the server dies."""
+	while True:
+		try:
+			stream_until_disconnected(mounter)
+		except (OSError, ConnectionError, ValueError) as error:
+			log.warning("adb device stream ended (%s); reconnecting", error)
+		time.sleep(RECONNECT_DELAY)
+		start_adb_server()
+
+
+def stream_until_disconnected(mounter: "DeviceMounter") -> None:
+	"""Apply every device-state update the adb server pushes until it hangs up."""
+	with connect_to_adb_server() as server:
+		log.info("Tracking adb devices")
+		for states in read_device_states(server):
+			mounter.apply(states)
+
+
+class DeviceMounter:
+	"""Keeps the set of adbfs mounts in step with the authorised adb devices."""
+
+	def __init__(self) -> None:
+		self.mounts: dict[str, Path] = {}
+		self.prompted: set[str] = set()
+
+	def apply(self, states: dict[str, str]) -> None:
+		"""Mount, prompt for, or unmount devices so reality matches `states`."""
+		for serial, state in states.items():
+			self.apply_one(serial, state)
+		for serial in set(self.mounts) - set(states):
+			self.unmount(serial)
+
+	def apply_one(self, serial: str, state: str) -> None:
+		"""React to a single device's reported adb state."""
+		if state == "device":
+			self.prompted.discard(serial)
+			if serial not in self.mounts:
+				self.mount(serial)
+		elif state == "unauthorized":
+			self.prompt_for_authorization(serial)
+		elif serial in self.mounts:
+			self.unmount(serial)
+
+	def mount(self, serial: str) -> None:
+		"""Mount one device, cleaning up the mount point if adbfs refuses."""
+		remember_device_name(serial, read_device_name(serial))
+		label = read_device_label(serial)
+		mount_point = self.reserve_mount_point(label, serial)
+		if not run_adbfs(serial, mount_point):
+			unmount_path(mount_point)
+			notify(f"Could not mount {label}", "adbfs failed; see the service log.", "critical")
+			return
+		self.mounts[serial] = mount_point
+		log.info("Mounted %s (%s) at %s", label, serial, mount_point)
+		notify(f"{label} mounted", f"Browse it at {display_path(mount_point)}")
+
+	def unmount(self, serial: str) -> None:
+		"""Release the mount belonging to a device that went away."""
+		mount_point = self.mounts.pop(serial)
+		unmount_path(mount_point)
+		log.info("Unmounted %s", mount_point)
+		notify(f"{mount_point.name} disconnected", "The mount point has been released.", "low")
+
+	def unmount_everything(self) -> None:
+		"""Drop stale mounts left behind by a previous run of this service."""
+		MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+		for mount_point in sorted(MOUNT_ROOT.iterdir()):
+			unmount_path(mount_point)
+		self.mounts.clear()
+
+	def reserve_mount_point(self, label: str, serial: str) -> Path:
+		"""Pick a free directory under the mount root and create it."""
+		mount_point = MOUNT_ROOT / label
+		if mount_point in self.mounts.values():
+			mount_point = MOUNT_ROOT / f"{label}_{serial}"
+		else:
+			unmount_path(mount_point)
+		mount_point.mkdir(parents=True, exist_ok=True)
+		return mount_point
+
+	def prompt_for_authorization(self, serial: str) -> None:
+		"""Ask the user once to accept the USB debugging dialog on the phone."""
+		if serial in self.prompted:
+			return
+		self.prompted.add(serial)
+		log.info("Device %s is waiting for authorization", serial)
+		notify(
+			"Android device needs authorization",
+			"Unlock the phone and tap Allow on the USB debugging prompt. "
+			"Tick 'Always allow from this computer' to skip this next time.",
+			"critical",
+		)
+
+
+def watch_usb_for_disabled_debugging(lines: Iterator[str], prompter: "DebuggingPrompter") -> None:
+	"""Prompt about USB debugging whenever a phone shows up without adb.
+
+	Shutdown closes the monitor underneath this thread, so a read failing partway
+	through is the expected way for the loop to end rather than a fault.
+	"""
+	try:
+		for properties in read_udev_events(lines):
+			if is_usb_removal(properties):
+				prompter.forget(properties.get("DEVPATH", ""))
+			elif is_phone_without_debugging(properties):
+				prompter.schedule(properties)
+	except (OSError, ValueError) as error:
+		log.debug("USB watcher stopped: %s", error)
+
+
+class DebuggingPrompter:
+	"""Asks the user what to do about phones connected without USB debugging.
+
+	A phone re-enumerates whenever its USB mode changes, and answering the dialog
+	is itself likely to cause that, so a device is suppressed both while its
+	dialog is open and for a while after it is answered. The record is dropped as
+	soon as the device leaves the bus, so unplugging and replugging always asks
+	again.
+	"""
+
+	def __init__(self) -> None:
+		self.pending: set[str] = set()
+		self.decided: dict[str, float] = {}
+		self.paths: dict[str, str] = {}
+		self.lock = threading.Lock()
+
+	def schedule(self, properties: dict[str, str]) -> None:
+		"""Prompt about a device shortly, unless it is already being handled."""
+		if not self.claim(properties):
+			return
+		timer = threading.Timer(DEBUGGING_PROMPT_DELAY, self.prompt, [properties])
+		timer.daemon = True
+		timer.start()
+
+	def claim(self, properties: dict[str, str]) -> bool:
+		"""Reserve a device for prompting; False means it is already handled."""
+		key = device_key(properties)
+		with self.lock:
+			self.paths[properties.get("DEVPATH", "")] = key
+			if key in self.pending or self.answered_recently(key):
+				return False
+			self.pending.add(key)
+			return True
+
+	def answered_recently(self, key: str) -> bool:
+		"""Report whether the user has already answered for this device just now."""
+		answered_at = self.decided.get(key)
+		return answered_at is not None and time.monotonic() - answered_at < DECISION_COOLDOWN
+
+	def prompt(self, properties: dict[str, str]) -> None:
+		"""Run the dialog for one device, recording the answer however it ends.
+
+		The answer is filed against the device path as well as the serial, because
+		the removal event that later clears it only carries the path.
+		"""
+		key = device_key(properties)
+		try:
+			handle_missing_debugging(properties)
+		finally:
+			with self.lock:
+				self.pending.discard(key)
+				self.decided[key] = time.monotonic()
+				self.paths[properties.get("DEVPATH", "")] = key
+
+	def forget(self, device_path: str) -> None:
+		"""Drop a device's recorded answer once it leaves the bus."""
+		with self.lock:
+			self.decided.pop(self.paths.pop(device_path, ""), None)
+
+
+def handle_missing_debugging(properties: dict[str, str]) -> None:
+	"""Offer the ways forward for a phone adb cannot see."""
+	name = device_display_name(properties)
+	serials_before = read_adb_serials()
+	if debugging_became_available(properties, serials_before):
+		return
+	log.info("%s was connected without USB debugging", name)
+	if ask_about_disabled_debugging(name, properties, serials_before) == CHOICE_MOUNT_MTP:
+		mount_with_mtp(properties, name)
+
+
+def debugging_became_available(properties: dict[str, str], serials_before: set[str]) -> bool:
+	"""Report whether adb can now reach a device it could not reach before.
+
+	Enabling debugging makes the phone re-enumerate under a new device path, so
+	the old path going quiet proves nothing; a serial adb did not have before does.
+	"""
+	if has_adb_interface(read_current_usb_interfaces(properties)):
+		return True
+	return bool(read_adb_serials() - serials_before)
+
+
+def read_adb_serials() -> set[str]:
+	"""List the serials the adb server currently knows about."""
+	return set(parse_device_list(run_text([ADB_BINARY, "devices"])))
+
+
+def ask_about_disabled_debugging(name: str, properties: dict[str, str], serials_before: set[str]) -> str:
+	"""Show the dialog and wait for whichever comes first, an answer or the phone.
+
+	Enabling debugging makes the phone reachable within a second or two and the
+	mount happens on its own, which leaves the dialog asserting something that is
+	no longer true, so it is taken down rather than left for the user to dismiss.
+	"""
+	dialog = subprocess.Popen(build_debugging_dialog(name), stdout=subprocess.PIPE, text=True)
+	pin_dialog_above_other_windows()
+	withdraw_dialog_when_moot(dialog, name, properties, serials_before)
+	dialog.communicate()
+	if dialog.returncode == 0:
+		return CHOICE_MOUNT_MTP
+	return CHOICE_RESOLVED if dialog.returncode < 0 else CHOICE_DECLINE
+
+
+def withdraw_dialog_when_moot(dialog: subprocess.Popen, name: str, properties: dict[str, str],
+                              serials_before: set[str]) -> None:
+	"""Take the dialog down as soon as it stops describing the truth."""
+	def watch() -> None:
+		while dialog.poll() is None:
+			reason = dialog_no_longer_applies(properties, serials_before)
+			if reason:
+				log.info("Withdrawing the dialog for %s: %s", name, reason)
+				dialog.terminate()
+				return
+			time.sleep(ADB_RECHECK_INTERVAL)
+
+	threading.Thread(target=watch, daemon=True).start()
+
+
+def dialog_no_longer_applies(properties: dict[str, str], serials_before: set[str]) -> str:
+	"""Say why the dialog has stopped being true, or nothing while it still holds.
+
+	Enabling debugging makes the phone re-enumerate, so its old device path goes
+	away in that case too; adb is asked once more before blaming an unplug.
+	"""
+	if debugging_became_available(properties, serials_before):
+		return "it became reachable over adb"
+	if usb_device_present(properties):
+		return ""
+	time.sleep(ADB_RECHECK_INTERVAL)
+	if debugging_became_available(properties, serials_before):
+		return "it became reachable over adb"
+	return "it was unplugged"
+
+
+def usb_device_present(properties: dict[str, str]) -> bool:
+	"""Report whether the device is still attached where udev announced it."""
+	device_path = properties.get("DEVPATH", "")
+	return bool(device_path) and Path("/sys" + device_path).exists()
+
+
+def pin_dialog_above_other_windows() -> None:
+	"""Keep the dialog on top once it appears.
+
+	This desktop focuses windows under the pointer, so merely moving the mouse
+	sends an unpinned dialog behind whatever it was covering. zenity cannot ask
+	for this itself, so the state is set on its window through the window manager.
+	"""
+	if not shutil.which("wmctrl"):
+		return
+	deadline = time.monotonic() + DIALOG_APPEARANCE_TIMEOUT
+	while time.monotonic() < deadline:
+		window = find_dialog_window()
+		if window:
+			run_quietly(["wmctrl", "-i", "-r", window, "-b", "add,above"], GIO_TIMEOUT)
+			return
+		time.sleep(DIALOG_POLL_INTERVAL)
+	log.debug("Dialog window never appeared, so it could not be pinned on top")
+
+
+def find_dialog_window() -> str:
+	"""Find the dialog's window id by matching its title."""
+	for line in run_text(["wmctrl", "-l"]).splitlines():
+		window, _, rest = line.partition(" ")
+		if DIALOG_TITLE in rest:
+			return window
+	return ""
+
+
+def build_debugging_dialog(name: str) -> list[str]:
+	"""Compose the desktop dialog offering the three ways forward."""
+	return [
+		"zenity", "--question", "--width=460",
+		f"--title={DIALOG_TITLE}",
+		"--icon-name=phone-symbolic",
+		f"--text={debugging_dialog_text(name)}",
+		f"--ok-label={MTP_BUTTON_LABEL}",
+		"--cancel-label=Don't mount",
+	]
+
+
+def debugging_dialog_text(name: str) -> str:
+	"""Write the dialog body, including where to find the setting on the phone."""
+	return (
+		f"<b>USB debugging is off on {name}</b>\n\n"
+		"If you don't want to mount it with adb - pick one of the options below, "
+		"otherwise the dialog will be closed automatically as soon as USB debugging "
+		"is enabled.\n\n"
+		"To turn it on: <b>Settings › About phone</b>, tap <b>Build number</b> seven "
+		"times, then <b>Settings › Additional settings › Developer options › "
+		"USB debugging</b>."
+	)
+
+
+def mount_with_mtp(properties: dict[str, str], name: str) -> None:
+	"""Fall back to gvfs, which reaches the phone's media without debugging."""
+	serial = properties.get("ID_SERIAL_SHORT", "")
+	if not find_mtp_address(serial):
+		notify(f"No MTP volume for {name}", "The phone is not offering file access.", "critical")
+		return
+	address = wait_for_mtp_contents(serial, MTP_FIRST_LOOK)
+	if address:
+		open_file_manager(address, name)
+		return
+	guide_to_file_transfer(serial, name)
+
+
+def guide_to_file_transfer(serial: str, name: str) -> None:
+	"""Ask the user to allow file access, then follow up once they have."""
+	hint = notify(
+		f"{name} is not sharing files yet",
+		"Unlock the phone and choose File transfer in its USB notification.",
+		"critical",
+	)
+	address = wait_for_mtp_contents(serial, MTP_ACCESS_TIMEOUT)
+	if not address:
+		log.info("%s never started sharing files", name)
+		return
+	notify(f"{name} is ready", "Opening it in the file manager.", "normal", replaces=hint)
+	open_file_manager(address, name)
+
+
+def open_file_manager(address: str, name: str) -> None:
+	"""Open a mounted location in the desktop's file manager."""
+	log.info("Opening %s at %s", name, address)
+	run_quietly(["gio", "open", address], GIO_TIMEOUT)
+
+
+def find_mtp_address(serial: str) -> str:
+	"""Find the gvfs address of the MTP volume belonging to a USB serial."""
+	for line in run_text(["gio", "mount", "-li"]).splitlines():
+		address = line.strip().removeprefix("activation_root=")
+		if address.startswith("mtp://") and serial and serial in address:
+			return address
+	return ""
+
+
+def wait_for_mtp_contents(serial: str, timeout: float) -> str:
+	"""Wait for the phone to start offering storage, returning where it mounted.
+
+	The volume is looked up and mounted afresh each round because choosing File
+	transfer makes the phone re-enumerate, which drops the existing mount. It is
+	never unmounted here: tearing an MTP mount down leaves the session half-open
+	on the phone, and nothing short of a replug reopens it.
+	"""
+	deadline = time.monotonic() + timeout
+	while True:
+		address = find_mtp_address(serial)
+		if address and mtp_storage_visible(address):
+			return address
+		if time.monotonic() >= deadline:
+			return ""
+		time.sleep(MTP_POLL_INTERVAL)
+
+
+def mtp_storage_visible(address: str) -> bool:
+	"""Report whether the phone is exposing any storage at this address."""
+	run_quietly(["gio", "mount", address], GIO_TIMEOUT)
+	return bool(run_text(["gio", "list", address]).strip())
+
+
+def device_key(properties: dict[str, str]) -> str:
+	"""Identify a USB device across the re-enumeration a mode change causes."""
+	return properties.get("ID_SERIAL_SHORT") or properties.get("DEVPATH", "")
+
+
+def is_usb_removal(properties: dict[str, str]) -> bool:
+	"""Report whether this event is a USB device leaving the bus."""
+	return properties.get("ACTION") == "remove" and properties.get("DEVTYPE") == "usb_device"
+
+
+def is_phone_without_debugging(properties: dict[str, str]) -> bool:
+	"""Report whether this event is an Android device offering media access only."""
+	if properties.get("ACTION") != "add" or properties.get("DEVTYPE") != "usb_device":
+		return False
+	interfaces = properties.get("ID_USB_INTERFACES", "")
+	return has_media_interface(interfaces) and not has_adb_interface(interfaces)
+
+
+def read_current_usb_interfaces(properties: dict[str, str]) -> str:
+	"""Re-read a device's USB interface list straight from the udev database."""
+	device_path = properties.get("DEVPATH", "")
+	command = [udevadm_binary(), "info", "--query=property", f"--path={device_path}"]
+	current = parse_udev_properties(run_text(command).splitlines())
+	return current.get("ID_USB_INTERFACES", "")
+
+
+def udevadm_binary() -> str:
+	"""Locate udevadm, which is not always on a systemd user unit's PATH."""
+	return shutil.which("udevadm") or "/usr/bin/udevadm"
+
+
+def has_adb_interface(interfaces: str) -> bool:
+	"""Report whether the USB interface list advertises adb (class ff/42)."""
+	return ADB_INTERFACE_PREFIX in interfaces
+
+
+def has_media_interface(interfaces: str) -> bool:
+	"""Report whether the USB interface list advertises MTP or PTP (class 06/01)."""
+	return MEDIA_INTERFACE_PREFIX in interfaces
+
+
+def device_display_name(properties: dict[str, str]) -> str:
+	"""Name a device the way its owner named it, if we have ever reached it.
+
+	USB descriptors carry the marketing name burnt into the ROM, not the name the
+	owner set, and that name is only readable over adb -- which is exactly what is
+	unavailable here. So the last name adb saw for this serial wins when there is one.
+	"""
+	return remembered_device_name(properties.get("ID_SERIAL_SHORT", "")) or describe_usb_device(properties)
+
+
+def describe_usb_device(properties: dict[str, str]) -> str:
+	"""Build a human readable name for a USB device from its udev properties."""
+	vendor = properties.get("ID_VENDOR") or properties.get("ID_VENDOR_FROM_DATABASE") or ""
+	model = properties.get("ID_MODEL") or properties.get("ID_MODEL_FROM_DATABASE") or "Android device"
+	return f"{vendor} {model}".replace("_", " ").strip()
+
+
+def start_udev_monitor() -> tuple[subprocess.Popen, Iterator[str]]:
+	"""Spawn an unprivileged udev monitor restricted to USB property events.
+
+	udevadm only flushes each line when it believes it is writing to a terminal,
+	so it is given a pty rather than a pipe; otherwise events would sit in its
+	output buffer for as long as it takes to fill a block.
+	"""
+	command = [udevadm_binary(), "monitor", "--udev", "--subsystem-match=usb", "--property"]
+	controller, worker = pty.openpty()
+	monitor = subprocess.Popen(command, stdout=worker, stderr=subprocess.DEVNULL, close_fds=True)
+	os.close(worker)
+	return monitor, read_unbuffered_lines(controller)
+
+
+def read_unbuffered_lines(descriptor: int) -> Iterator[str]:
+	"""Yield lines from a descriptor without the read-ahead that iteration adds."""
+	with os.fdopen(descriptor, "r", buffering=1, errors="replace") as stream:
+		while line := stream.readline():
+			yield line.replace("\r", "")
+
+
+def read_udev_events(stream: Iterator[str]) -> Iterator[dict[str, str]]:
+	"""Turn the blank-line separated udev monitor output into property dicts."""
+	block: list[str] = []
+	for line in stream:
+		if line.strip():
+			block.append(line)
+			continue
+		if block:
+			yield parse_udev_properties(block)
+		block = []
+
+
+def parse_udev_properties(lines: list[str]) -> dict[str, str]:
+	"""Parse `KEY=value` lines, ignoring the monitor's header line."""
+	properties = {}
+	for line in lines:
+		key, separator, value = line.strip().partition("=")
+		if separator and " " not in key:
+			properties[key] = value
+	return properties
+
+
+def connect_to_adb_server() -> socket.socket:
+	"""Open a socket subscribed to the adb server's device tracking stream."""
+	start_adb_server()
+	server = socket.create_connection(ADB_SERVER_ADDRESS, timeout=10)
+	send_adb_request(server, "host:track-devices")
+	server.settimeout(None)
+	return server
+
+
+def send_adb_request(server: socket.socket, request: str) -> None:
+	"""Send one length-prefixed adb request and check that it was accepted."""
+	server.sendall(f"{len(request):04x}{request}".encode())
+	status = receive_exactly(server, 4)
+	if status != b"OKAY":
+		raise ConnectionError(f"adb server rejected {request!r}: {status!r}")
+
+
+def read_device_states(server: socket.socket) -> Iterator[dict[str, str]]:
+	"""Yield a serial-to-state mapping every time the device list changes."""
+	while True:
+		length = int(receive_exactly(server, 4), 16)
+		payload = receive_exactly(server, length).decode() if length else ""
+		yield parse_device_list(payload)
+
+
+def parse_device_list(payload: str) -> dict[str, str]:
+	"""Parse the `serial<tab>state` lines of an adb device list."""
+	states = {}
+	for line in payload.splitlines():
+		serial, separator, state = line.partition("\t")
+		if separator:
+			states[serial.strip()] = state.strip()
+	return states
+
+
+def receive_exactly(server: socket.socket, count: int) -> bytes:
+	"""Read exactly `count` bytes, failing loudly if the server hangs up."""
+	chunks = []
+	while count > 0:
+		chunk = server.recv(count)
+		if not chunk:
+			raise ConnectionError("adb server closed the connection")
+		chunks.append(chunk)
+		count -= len(chunk)
+	return b"".join(chunks)
+
+
+def run_adbfs(serial: str, mount_point: Path) -> bool:
+	"""Mount one device with adbfs and report whether the mount came up."""
+	environment = os.environ | {"ANDROID_SERIAL": serial}
+	command = [str(ADBFS_BINARY), str(mount_point), "-o", "auto_unmount"]
+	result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
+	if result.returncode != 0:
+		log.error("adbfs failed for %s: %s", serial, result.stderr.strip())
+		return False
+	return wait_for_live_mount(mount_point)
+
+
+def wait_for_live_mount(mount_point: Path) -> bool:
+	"""Wait for the adbfs process, which forks into the background, to publish a mount."""
+	deadline = time.monotonic() + MOUNT_READY_TIMEOUT
+	while time.monotonic() < deadline:
+		if is_readable_mount(mount_point):
+			return True
+		time.sleep(MOUNT_POLL_INTERVAL)
+	log.error("adbfs never produced a readable mount at %s", mount_point)
+	return False
+
+
+def is_readable_mount(mount_point: Path) -> bool:
+	"""Report whether the path is a mount point whose contents can be listed.
+
+	A mount whose adbfs process has died still looks like a directory but fails
+	every access with EIO, so listing it is the only reliable liveness check.
+	"""
+	try:
+		if not os.path.ismount(mount_point):
+			return False
+		os.listdir(mount_point)
+	except OSError:
+		return False
+	return True
+
+
+def unmount_path(mount_point: Path) -> None:
+	"""Detach an adbfs mount and remove its directory, forcing it if need be.
+
+	Removing the directory is tried first because that is enough for a plain
+	empty directory; a busy mount answers EBUSY and a dead one answers EIO, and
+	both are cleared by handing the path to fusermount.
+	"""
+	if remove_directory(mount_point):
+		return
+	run_fusermount("-u", mount_point)
+	if remove_directory(mount_point):
+		return
+	run_fusermount("-uz", mount_point)
+	remove_directory(mount_point)
+
+
+def run_fusermount(option: str, mount_point: Path) -> None:
+	"""Ask fusermount to detach a path, ignoring the paths it does not own."""
+	fusermount = shutil.which("fusermount") or "/usr/bin/fusermount"
+	run_quietly([fusermount, option, str(mount_point)])
+
+
+def remove_directory(mount_point: Path) -> bool:
+	"""Remove a mount point directory and report whether it is now gone."""
+	try:
+		mount_point.rmdir()
+	except FileNotFoundError:
+		return True
+	except OSError as error:
+		log.debug("Cannot remove %s yet: %s", mount_point, error)
+		return False
+	return True
+
+
+def read_device_name(serial: str) -> str:
+	"""Read the name a device's owner gave it, or nothing if none is readable.
+
+	`bluetooth_name` is asked first because it is the key vendor skins actually
+	update when the owner renames the device; the AOSP `device_name` is often
+	stamped once from the marketing name at first boot and left stale.
+	"""
+	for command in DEVICE_NAME_COMMANDS:
+		name = run_device_command(serial, command)
+		if name:
+			return name
+	return ""
+
+
+def read_device_label(serial: str) -> str:
+	"""Name a device after the name its owner gave it, falling back to its serial."""
+	return sanitize_label(read_device_name(serial)) or sanitize_label(serial) or "android"
+
+
+def run_device_command(serial: str, command: tuple[str, ...]) -> str:
+	"""Run a shell command on a device, treating an unset setting as no answer."""
+	output = run_text([ADB_BINARY, "-s", serial, "shell", *command]).strip()
+	return "" if output == "null" else output
+
+
+def sanitize_label(value: str) -> str:
+	"""Reduce arbitrary text to a lower case, hyphen separated directory name."""
+	return re.sub(r"[^a-z0-9.]+", "-", value.strip().lower()).strip("-.")
+
+
+def run_text(command: list[str]) -> str:
+	"""Run a command and return its stdout, or an empty string on failure."""
+	try:
+		result = subprocess.run(command, capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
+	except (OSError, subprocess.SubprocessError) as error:
+		log.debug("Command %s failed: %s", command[0], error)
+		return ""
+	return result.stdout if result.returncode == 0 else ""
+
+
+def run_quietly(command: list[str], timeout: float = COMMAND_TIMEOUT) -> int:
+	"""Run a command for its effect, returning -1 if it fails or outlives its timeout.
+
+	gvfs commands in particular can block indefinitely on a phone that has stopped
+	answering, and this runs on the thread holding the user's dialog.
+	"""
+	try:
+		return subprocess.run(command, capture_output=True, timeout=timeout).returncode
+	except (OSError, subprocess.SubprocessError) as error:
+		log.debug("Command %s failed: %s", command[0], error)
+		return -1
+
+
+def remembered_device_name(serial: str) -> str:
+	"""Recall the name a device gave for itself the last time adb could reach it."""
+	return read_remembered_names().get(serial, "")
+
+
+def remember_device_name(serial: str, name: str) -> None:
+	"""Record a device's own name, which is unreadable once adb cannot reach it."""
+	if not serial or not name:
+		return
+	names = read_remembered_names() | {serial: name}
+	try:
+		NAME_CACHE.parent.mkdir(parents=True, exist_ok=True)
+		NAME_CACHE.write_text(json.dumps(names, indent=1, sort_keys=True))
+	except OSError as error:
+		log.debug("Could not save remembered device names: %s", error)
+
+
+def read_remembered_names() -> dict[str, str]:
+	"""Load the remembered device names, tolerating a missing or damaged cache."""
+	try:
+		return json.loads(NAME_CACHE.read_text())
+	except (OSError, ValueError):
+		return {}
+
+
+def start_adb_server() -> None:
+	"""Make sure an adb server is listening before we try to talk to it."""
+	subprocess.run([ADB_BINARY, "start-server"], capture_output=True, timeout=COMMAND_TIMEOUT)
+
+
+def notify(title: str, body: str, urgency: str = "normal", replaces: str = "") -> str:
+	"""Show a desktop notification and return its id, so it can be updated later."""
+	command = ["notify-send", "--app-name=Android automount", "--icon=phone-symbolic",
+	           f"--urgency={urgency}", "--print-id"]
+	if replaces:
+		command.append(f"--replace-id={replaces}")
+	result = subprocess.run(command + [title, body], capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
+	return result.stdout.strip()
+
+
+def display_path(mount_point: Path) -> str:
+	"""Shorten a path under the home directory for display in notifications."""
+	try:
+		return f"~/{mount_point.relative_to(Path.home())}"
+	except ValueError:
+		return str(mount_point)
+
+
+def install_shutdown_handler(mounter: DeviceMounter, monitor: subprocess.Popen) -> None:
+	"""Release every mount and stop the udev monitor when systemd stops the service."""
+	def shut_down(signal_number, frame):
+		monitor.terminate()
+		mounter.unmount_everything()
+		raise SystemExit(0)
+
+	signal.signal(signal.SIGTERM, shut_down)
+	signal.signal(signal.SIGINT, shut_down)
+
+
+def ensure_session_bus_address() -> None:
+	"""Point notify-send at the user's session bus when systemd did not."""
+	if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
+		runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+		os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime_dir}/bus"
+
+
+def configure_logging() -> None:
+	"""Send readable log lines to stderr, where the journal picks them up."""
+	logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())
