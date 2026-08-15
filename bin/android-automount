@@ -64,6 +64,8 @@ MTP_POLL_INTERVAL = 3.0
 GIO_TIMEOUT = 20.0
 RECONNECT_DELAY = 5.0
 MOUNT_READY_TIMEOUT = 15.0
+MOUNT_STABLE_SECONDS = 60.0
+ADBFS_STOP_TIMEOUT = 10.0
 MOUNT_POLL_INTERVAL = 0.25
 COMMAND_TIMEOUT = 60
 
@@ -109,12 +111,15 @@ class DeviceMounter:
 	def __init__(self) -> None:
 		self.mounts: dict[str, Path] = {}
 		self.prompted: set[str] = set()
+		self.lock = threading.RLock()
 
 	def apply(self, states: dict[str, str]) -> None:
 		"""Mount, prompt for, or unmount devices so reality matches `states`."""
 		for serial, state in states.items():
 			self.apply_one(serial, state)
-		for serial in set(self.mounts) - set(states):
+		with self.lock:
+			departed = set(self.mounts) - set(states)
+		for serial in departed:
 			self.unmount(serial)
 
 	def apply_one(self, serial: str, state: str) -> None:
@@ -133,17 +138,51 @@ class DeviceMounter:
 		remember_device_name(serial, read_device_name(serial))
 		label = read_device_label(serial)
 		mount_point = self.reserve_mount_point(label, serial)
-		if not run_adbfs(serial, mount_point):
-			unmount_path(mount_point)
-			notify(f"Could not mount {label}", "adbfs failed; see the service log.", "critical")
+		adbfs = start_adbfs(serial, mount_point)
+		if not wait_for_live_mount(mount_point):
+			abandon_adbfs(adbfs, mount_point, label)
 			return
-		self.mounts[serial] = mount_point
+		with self.lock:
+			self.mounts[serial] = mount_point
+		self.supervise(adbfs, serial, mount_point, label)
 		log.info("Mounted %s (%s) at %s", label, serial, mount_point)
 		notify(f"{label} mounted", f"Browse it at {display_path(mount_point)}")
 
+	def supervise(self, adbfs: subprocess.Popen, serial: str, mount_point: Path, label: str) -> None:
+		"""Follow one adbfs process for as long as it lives."""
+		arguments = (adbfs, serial, mount_point, label)
+		threading.Thread(target=self.watch_adbfs, args=arguments, daemon=True).start()
+
+	def watch_adbfs(self, adbfs: subprocess.Popen, serial: str, mount_point: Path, label: str) -> None:
+		"""Relay what adbfs reports, then clean up after it however it ends."""
+		started = time.monotonic()
+		forward_adbfs_errors(adbfs, label)
+		status = adbfs.wait()
+		self.handle_adbfs_exit(serial, mount_point, label, status, time.monotonic() - started)
+
+	def handle_adbfs_exit(self, serial: str, mount_point: Path, label: str,
+	                      status: int, lifetime: float) -> None:
+		"""Take down a mount whose adbfs stopped, and put it back if it was healthy.
+
+		A mount that fell over almost immediately is not remounted, since retrying
+		it would only produce the same collapse in a loop.
+		"""
+		with self.lock:
+			if self.mounts.get(serial) != mount_point:
+				return
+			del self.mounts[serial]
+		log.error("adbfs for %s exited with status %s after %.0f seconds", label, status, lifetime)
+		unmount_path(mount_point)
+		if lifetime < MOUNT_STABLE_SECONDS or serial not in read_adb_serials():
+			notify(f"{label} is no longer mounted", "adbfs stopped; see the service log.", "critical")
+			return
+		notify(f"{label} is being remounted", "adbfs stopped unexpectedly.", "normal")
+		self.mount(serial)
+
 	def unmount(self, serial: str) -> None:
 		"""Release the mount belonging to a device that went away."""
-		mount_point = self.mounts.pop(serial)
+		with self.lock:
+			mount_point = self.mounts.pop(serial)
 		unmount_path(mount_point)
 		log.info("Unmounted %s", mount_point)
 		notify(f"{mount_point.name} disconnected", "The mount point has been released.", "low")
@@ -153,12 +192,15 @@ class DeviceMounter:
 		MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
 		for mount_point in sorted(MOUNT_ROOT.iterdir()):
 			unmount_path(mount_point)
-		self.mounts.clear()
+		with self.lock:
+			self.mounts.clear()
 
 	def reserve_mount_point(self, label: str, serial: str) -> Path:
 		"""Pick a free directory under the mount root and create it."""
 		mount_point = MOUNT_ROOT / label
-		if mount_point in self.mounts.values():
+		with self.lock:
+			taken = mount_point in self.mounts.values()
+		if taken:
 			mount_point = MOUNT_ROOT / f"{label}_{serial}"
 		else:
 			unmount_path(mount_point)
@@ -648,15 +690,45 @@ def receive_exactly(server: socket.socket, count: int) -> bytes:
 	return b"".join(chunks)
 
 
-def run_adbfs(serial: str, mount_point: Path) -> bool:
-	"""Mount one device with adbfs and report whether the mount came up."""
+def start_adbfs(serial: str, mount_point: Path) -> subprocess.Popen:
+	"""Start adbfs in the foreground, where both its errors and its death are visible.
+
+	Left to daemonise, libfuse detaches and points its output at /dev/null, so a
+	mount that later collapses does so in silence. Kept in the foreground, adbfs
+	traces every filesystem operation to stdout, which is dropped, and reports adb
+	and fuse failures on stderr, which is what reaches the journal.
+	"""
 	environment = os.environ | {"ANDROID_SERIAL": serial}
-	command = [str(ADBFS_BINARY), str(mount_point), "-o", "auto_unmount"]
-	result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
-	if result.returncode != 0:
-		log.error("adbfs failed for %s: %s", serial, result.stderr.strip())
-		return False
-	return wait_for_live_mount(mount_point)
+	command = [str(ADBFS_BINARY), str(mount_point), "-f", "-o", "auto_unmount"]
+	return subprocess.Popen(command, env=environment, stdout=subprocess.DEVNULL,
+	                        stderr=subprocess.PIPE, text=True, errors="replace")
+
+
+def forward_adbfs_errors(adbfs: subprocess.Popen, label: str) -> None:
+	"""Copy adbfs's error output into the journal until the process ends.
+
+	Read a line at a time rather than by iteration, which would hold each message
+	in a read-ahead buffer until enough of them accumulated to flush it.
+	"""
+	while line := adbfs.stderr.readline():
+		message = line.strip()
+		if message:
+			log.error("adbfs[%s]: %s", label, message)
+
+
+def abandon_adbfs(adbfs: subprocess.Popen, mount_point: Path, label: str) -> None:
+	"""Give up on a mount that never came up, leaving nothing running behind."""
+	adbfs.terminate()
+	try:
+		_, errors = adbfs.communicate(timeout=ADBFS_STOP_TIMEOUT)
+	except subprocess.TimeoutExpired:
+		adbfs.kill()
+		errors = ""
+	for message in (errors or "").splitlines():
+		if message.strip():
+			log.error("adbfs[%s]: %s", label, message.strip())
+	unmount_path(mount_point)
+	notify(f"Could not mount {label}", "adbfs failed; see the service log.", "critical")
 
 
 def wait_for_live_mount(mount_point: Path) -> bool:

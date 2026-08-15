@@ -9,12 +9,6 @@ once, the first match is pinned and the second may not be. Tracking the window i
 per dialog would fix it. Two simultaneous dialogs is unlikely enough that this has
 not been worth the plumbing.
 
-## A dead mount is only noticed when adb changes state
-
-If an `adbfs` process dies while the phone stays connected, the mount goes stale
-and nothing remounts it, because the adb device state never changed. A periodic
-liveness sweep over `self.mounts` using `is_readable_mount` would catch it.
-
 ## adbfs is built from source
 
 It is not packaged in Debian or Ubuntu, so every install compiles it. Vendoring a

@@ -91,6 +91,15 @@ name, `adb shell settings list secure | grep name` will tell you where yours kee
 settings screen closes, not when you type it. Press Home after renaming, then
 replug.
 
+**adbfs runs in the foreground and is supervised.** Left to daemonise, libfuse
+points its output at `/dev/null`, so a mount that later collapses does so in
+silence and keeps answering `Transport endpoint is not connected` until something
+notices. Instead it is kept in the foreground: its per-operation tracing goes to
+stdout and is dropped, its adb and fuse errors go to stderr and into the journal,
+and its exit is the signal to clean the mount up. A mount that survived a minute
+is remounted automatically; one that collapsed sooner is not, since retrying it
+would only loop.
+
 **MTP mounts are left for gvfs to clean up, deliberately.** Nothing leaks: gvfs
 owns that mount and drops it when the phone leaves the bus. This service never
 unmounts one itself because tearing down a *live* MTP session leaves it half-open
